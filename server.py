@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import uvicorn
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 import httpx
@@ -94,12 +95,11 @@ class WhatsAppRequest(BaseModel):
     language: str = "en"
 
 class WhatsAppResponse(BaseModel):
-    """Response model for WhatsApp messages"""
-    chatId:str
-    phoneNumber: str
-    message: str
-    timestamp: str = None
-    status: str = "success"
+    """Response model for WhatsApp messages - Matches agent service payload"""
+    chatId: str
+    phone_number: str  # Changed from phoneNumber to match agent service
+    response: str      # Changed from message to match agent service
+    sources: list = [] # Added sources list from agent service
 
 class HealthResponse(BaseModel):
     """Health check response model"""
@@ -328,17 +328,17 @@ async def send_to_agent(chatId: str, message: str, user_data: dict) -> str:
             agent_data = response.json()
             print(f"📦 Response data: {agent_data}")
             
-            # Extract and return the 'response' field from agent's JSON
-            agent_response = agent_data.get("response", "No response from agent")
-            
-            print(f"✅ Successfully got agent response: {str(agent_response)[:100]}...")
-            return agent_response
+            # Return complete agent response with response and sources
+            return agent_data
             
     except httpx.TimeoutException:
         # Handle timeout errors - agent service is taking too long
         error_msg = f"Agent service timeout for user {phone_number}"
         print(f"⏱️  {error_msg}")
-        return "Sorry, our service is taking longer than expected. Please try again in a few moments."
+        return {
+            "response": "Sorry, our service is taking longer than expected. Please try again in a few moments.",
+            "sources": []
+        }
         
     except httpx.HTTPStatusError as e:
         # Handle HTTP status errors (4xx, 5xx)
@@ -346,39 +346,57 @@ async def send_to_agent(chatId: str, message: str, user_data: dict) -> str:
         print(f"❌ Agent service HTTP error: {status_code}")
         print(f"   Response: {e.response.text[:200]}")
         
+        error_msg = ""
         if status_code == 405:
-            return "Sorry, our AI assistant is currently unavailable. We're working to restore the service. Please try again later."
+            error_msg = "Sorry, our AI assistant is currently unavailable. We're working to restore the service. Please try again later."
         elif status_code == 422:
-            return "Sorry, there was an issue with your request format. Please try again."
+            error_msg = "Sorry, there was an issue with your request format. Please try again."
         elif status_code >= 500:
-            return "Sorry, our AI assistant is experiencing technical difficulties. Please try again in a few minutes."
+            error_msg = "Sorry, our AI assistant is experiencing technical difficulties. Please try again in a few minutes."
         elif status_code >= 400:
-            return "Sorry, we're unable to process your request right now. Please try again later."
+            error_msg = "Sorry, we're unable to process your request right now. Please try again later."
         else:
-            return f"Agent error: {status_code}"
+            error_msg = f"Agent error: {status_code}"
+        
+        return {
+            "response": error_msg,
+            "sources": []
+        }
             
     except httpx.ConnectError as e:
         # Handle connection errors - service is down or unreachable
         print(f"🔌 Agent service connection error: {str(e)}")
         print(f"   Agent URL: {AGENT_URL}")
-        return "Sorry, our AI assistant is currently offline. We're working to restore the service. Please check back soon."
+        return {
+            "response": "Sorry, our AI assistant is currently offline. We're working to restore the service. Please check back soon.",
+            "sources": []
+        }
         
     except httpx.RequestError as e:
         # Handle other request errors
         print(f"📡 Agent service request error: {str(e)}")
-        return "Sorry, we're having trouble connecting to our AI assistant. Please try again in a few moments."
+        return {
+            "response": "Sorry, we're having trouble connecting to our AI assistant. Please try again in a few moments.",
+            "sources": []
+        }
         
     except ValueError as e:
         # JSON decode error
         print(f"📋 JSON parsing error: {str(e)}")
-        return "Sorry, we received an invalid response from our AI assistant. Please try again."
+        return {
+            "response": "Sorry, we received an invalid response from our AI assistant. Please try again.",
+            "sources": []
+        }
         
     except Exception as e:
         # Handle any other unexpected errors
         print(f"⚠️  Unexpected agent communication error: {str(e)}")
         import traceback
         traceback.print_exc()
-        return "Sorry, something went wrong. Please try again later."
+        return {
+            "response": "Sorry, something went wrong. Please try again later.",
+            "sources": []
+        }
 
 # ============================================================================
 # MAIN WHATSAPP ENDPOINT
@@ -431,8 +449,12 @@ async def handle_whatsapp_request(req: WhatsAppRequest):
         await update_user_message_count(req.phoneNumber)
         print("✅ Updated user statistics\n")
 
-        # Step 5: Translate agent response if necessary
-        final_message = agent_response
+        # Step 5: Extract response and sources from agent
+        agent_response_text = agent_response.get("response", "")
+        agent_sources = agent_response.get("sources", [])
+        
+        # Step 6: Translate agent response if necessary
+        final_message = agent_response_text
         if req.language and req.language != "en":
             print(f"Step 4️⃣: Translating response to {req.language}...")
             try:
@@ -441,27 +463,26 @@ async def handle_whatsapp_request(req: WhatsAppRequest):
                     trans_resp = await http_client.post(
                         speech_svc_url,
                         json={
-                            "text": agent_response,
+                            "text": agent_response_text,
                             "target_lang": req.language,
                             "source_lang": "en"
                         },
                         timeout=30.0
                     )
                     if trans_resp.status_code == 200:
-                        final_message = trans_resp.json().get("translated_text", agent_response)
+                        final_message = trans_resp.json().get("translated_text", agent_response_text)
                         print(f"✅ Translated response: {final_message[:100]}...")
                     else:
                         print(f"⚠️ Translation failed (status {trans_resp.status_code}), sending English.")
             except Exception as e:
                 print(f"⚠️ Translation error: {str(e)}, sending English.")
 
-        # Step 6: Prepare and return response
+        # Step 7: Prepare and return response - matching agent service payload
         response_data = {
             "chatId": req.chatId,
-            "phoneNumber": req.phoneNumber,
-            "message": final_message,
-            "timestamp": datetime.utcnow().isoformat(),
-            "status": "success"
+            "phone_number": req.phoneNumber,
+            "response": final_message,
+            "sources": agent_sources
         }
         
         print("✅ WHATSAPP REQUEST COMPLETE")
@@ -478,13 +499,12 @@ async def handle_whatsapp_request(req: WhatsAppRequest):
         import traceback
         traceback.print_exc()
         
-        # Return error response
+        # Return error response - matching agent service payload
         return {
-            "chatId":req.chatId,
-            "phoneNumber": req.phoneNumber,
-            "message": "Sorry, something went wrong processing your request. Please try again later.",
-            "timestamp": datetime.utcnow().isoformat(),
-            "status": "error"
+            "chatId": req.chatId,
+            "phone_number": req.phoneNumber,
+            "response": "Sorry, something went wrong processing your request. Please try again later.",
+            "sources": []
         }
 
 # ============================================================================
