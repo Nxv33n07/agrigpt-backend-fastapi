@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import uvicorn
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 import httpx
@@ -19,13 +20,16 @@ load_dotenv()
 # MongoDB Atlas connection string from environment variable
 MONGODB_URL = os.getenv("MONGODB_URL")
 # Agent service URL from environment variable
-AGENT_URL = os.getenv("AGENT_URL")  # e.g., https://agrigpt-backend-agent.onrender.com/chat
+AGENT_URL = os.getenv("AGENT_URL", "https://newapi.alumnx.com/agrigpt/agent/chat")
+# Speech service URL for translation (set in Vercel/Deployment environment)
+SPEECH_SERVICE_URL = os.getenv("SPEECH_SERVICE_URL", "https://newapi.alumnx.com/agrigpt/speech")
 
 print("\n" + "="*80)
 print("🚀 WHATSAPP BOT SERVICE - STARTUP CONFIGURATION")
 print("="*80)
 print(f"MONGODB_URL: {MONGODB_URL[:50]}..." if MONGODB_URL else "MONGODB_URL: NOT SET")
 print(f"AGENT_URL: {AGENT_URL}")
+print(f"SPEECH_SERVICE_URL: {SPEECH_SERVICE_URL}")
 print("="*80 + "\n")
 
 # Global variables for MongoDB client and collections
@@ -360,9 +364,9 @@ async def send_to_agent(chatId: str, message: str, user_data: dict, language: st
             "message": message,
             "language": language
         }
-        
+
         print(f"📤 Sending payload to agent: {json.dumps(payload)}")
-        
+
         # Use httpx async client to make POST request to agent
         async with httpx.AsyncClient() as http_client:
             response = await http_client.post(
@@ -374,27 +378,49 @@ async def send_to_agent(chatId: str, message: str, user_data: dict, language: st
                 },
                 timeout=120.0  # 120 second timeout
             )
-            
+
             print(f"📥 Received response - Status: {response.status_code}")
-            
-            # Raise exception if request failed
             response.raise_for_status()
-            
-            # Parse JSON response from agent
+
             agent_data = response.json()
             print(f"📦 Response data: {agent_data}")
-            
-            # Extract and return the 'response' field from agent's JSON
-            agent_response = agent_data.get("response", "No response from agent")
-            
-            print(f"✅ Successfully got agent response: {str(agent_response)[:100]}...")
-            return agent_response
+
+            # Agent returns bare "Not found" for new chat sessions that have no
+            # Gemini history yet. Retry using the Gemini-enabled fallback thread
+            # ("1") so the user always gets a real answer. The user's own chatId
+            # is still tried first — "1" is only used internally here.
+            if agent_data.get("response", "").strip() == "Not found in knowledge base":
+                print("⚠️  KB returned no answer — retrying via Gemini fallback thread...")
+                fallback_payload = {
+                    "chatId": "1",
+                    "phone_number": phone_number,
+                    "message": message
+                }
+                fb_response = await http_client.post(
+                    AGENT_URL,
+                    json=fallback_payload,
+                    headers={
+                        "accept": "application/json",
+                        "Content-Type": "application/json"
+                    },
+                    timeout=120.0
+                )
+                if fb_response.status_code == 200:
+                    fb_data = fb_response.json()
+                    if fb_data.get("response", "").strip() not in ("", "Not found in knowledge base"):
+                        print(f"✅ Gemini fallback response received")
+                        return fb_data
+
+            return agent_data
             
     except httpx.TimeoutException:
         # Handle timeout errors - agent service is taking too long
         error_msg = f"Agent service timeout for user {phone_number}"
         print(f"⏱️  {error_msg}")
-        return "Sorry, our service is taking longer than expected. Please try again in a few moments."
+        return {
+            "response": "Sorry, our service is taking longer than expected. Please try again in a few moments.",
+            "sources": []
+        }
         
     except httpx.HTTPStatusError as e:
         # Handle HTTP status errors (4xx, 5xx)
@@ -402,39 +428,57 @@ async def send_to_agent(chatId: str, message: str, user_data: dict, language: st
         print(f"❌ Agent service HTTP error: {status_code}")
         print(f"   Response: {e.response.text[:200]}")
         
+        error_msg = ""
         if status_code == 405:
-            return "Sorry, our AI assistant is currently unavailable. We're working to restore the service. Please try again later."
+            error_msg = "Sorry, our AI assistant is currently unavailable. We're working to restore the service. Please try again later."
         elif status_code == 422:
-            return "Sorry, there was an issue with your request format. Please try again."
+            error_msg = "Sorry, there was an issue with your request format. Please try again."
         elif status_code >= 500:
-            return "Sorry, our AI assistant is experiencing technical difficulties. Please try again in a few minutes."
+            error_msg = "Sorry, our AI assistant is experiencing technical difficulties. Please try again in a few minutes."
         elif status_code >= 400:
-            return "Sorry, we're unable to process your request right now. Please try again later."
+            error_msg = "Sorry, we're unable to process your request right now. Please try again later."
         else:
-            return f"Agent error: {status_code}"
+            error_msg = f"Agent error: {status_code}"
+        
+        return {
+            "response": error_msg,
+            "sources": []
+        }
             
     except httpx.ConnectError as e:
         # Handle connection errors - service is down or unreachable
         print(f"🔌 Agent service connection error: {str(e)}")
         print(f"   Agent URL: {AGENT_URL}")
-        return "Sorry, our AI assistant is currently offline. We're working to restore the service. Please check back soon."
+        return {
+            "response": "Sorry, our AI assistant is currently offline. We're working to restore the service. Please check back soon.",
+            "sources": []
+        }
         
     except httpx.RequestError as e:
         # Handle other request errors
         print(f"📡 Agent service request error: {str(e)}")
-        return "Sorry, we're having trouble connecting to our AI assistant. Please try again in a few moments."
+        return {
+            "response": "Sorry, we're having trouble connecting to our AI assistant. Please try again in a few moments.",
+            "sources": []
+        }
         
     except ValueError as e:
         # JSON decode error
         print(f"📋 JSON parsing error: {str(e)}")
-        return "Sorry, we received an invalid response from our AI assistant. Please try again."
+        return {
+            "response": "Sorry, we received an invalid response from our AI assistant. Please try again.",
+            "sources": []
+        }
         
     except Exception as e:
         # Handle any other unexpected errors
         print(f"⚠️  Unexpected agent communication error: {str(e)}")
         import traceback
         traceback.print_exc()
-        return "Sorry, something went wrong. Please try again later."
+        return {
+            "response": "Sorry, something went wrong. Please try again later.",
+            "sources": []
+        }
 
 # ============================================================================
 # MAIN WHATSAPP ENDPOINT
@@ -541,7 +585,7 @@ async def handle_whatsapp_request(req: WhatsAppRequest):
         # Save AI response to DB
         await save_chat_message(req.phoneNumber, "assistant", final_message, req.chatId, ai_msg_en)
 
-        # Step 6: Prepare and return response
+        # Step 7: Prepare and return response - matching agent service payload
         response_data = {
             "chatId": req.chatId,
             "phoneNumber": req.phoneNumber,
@@ -549,56 +593,6 @@ async def handle_whatsapp_request(req: WhatsAppRequest):
             "language": detected_lang,
             "timestamp": datetime.utcnow().isoformat(),
             "status": "success"
-        }
-        
-        print("✅ WHATSAPP REQUEST COMPLETE")
-        print(f"Response: {json.dumps(response_data, indent=2)}\n")
-        
-        return response_data
-        
-    except HTTPException as e:
-        print(f"\n❌ HTTP Exception: {e.detail}\n")
-        raise
-        
-    except Exception as e:
-        print(f"\n❌ Unexpected error: {str(e)}\n")
-        import traceback
-        traceback.print_exc()
-        
-        # Return error response
-        return {
-            "chatId":req.chatId,
-            "phoneNumber": req.phoneNumber,
-            "message": "Sorry, something went wrong processing your request. Please try again later.",
-            "timestamp": datetime.utcnow().isoformat(),
-            "status": "error"
-        }
-
-# ============================================================================
-# ERROR HANDLERS
-# ============================================================================
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    """Custom HTTP exception handler"""
-    print(f"\n❌ HTTP Exception - Status: {exc.status_code}, Detail: {exc.detail}\n")
-    return {
-        "error": exc.detail,
-        "status_code": exc.status_code,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    """Custom general exception handler"""
-    print(f"\n❌ General Exception: {str(exc)}\n")
-    return {
-        "error": "Internal server error",
-        "detail": str(exc),
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-# ============================================================================
 # ADMIN ENDPOINTS (For Dashboard)
 # ============================================================================
 
